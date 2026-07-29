@@ -1,0 +1,218 @@
+#!/bin/bash
+# gnome-hotspot-helper — root-side wrapper around create_ap.
+#
+# This script is only ever meant to be invoked via `pkexec` (see the
+# accompanying .policy file, which pins pkexec to this exact path). It is
+# installed root:root mode 0755 so an unprivileged user can't tamper with it
+# and then have pkexec run their version as root.
+#
+# Because everything here runs as root, every argument is strictly validated
+# before being handed to create_ap. Arguments arrive as a real argv array
+# (pkexec does not go through a shell), so there is no shell-injection
+# surface, but create_ap itself parses its own argv, so we still reject
+# values that look like flags (leading "-") and constrain charsets.
+
+set -euo pipefail
+
+STATE_DIR=/run/gnome-hotspot-toggle
+STATUS_FILE="$STATE_DIR/status.json"
+LOG_FILE=/var/log/gnome-hotspot-helper.log
+mkdir -p "$STATE_DIR"
+chmod 755 "$STATE_DIR"
+
+log() { echo "[$(date -Is)] $*" >>"$LOG_FILE"; }
+
+die() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+is_iface() {
+  local ifname=$1
+  [[ "$ifname" =~ ^[A-Za-z0-9_.-]{1,15}$ ]] || return 1
+  [[ -e "/sys/class/net/$ifname" ]]
+}
+
+require_not_flag() {
+  local v=$1
+  [[ "$v" != -* ]] || die "value '$v' must not start with '-'"
+}
+
+write_status() {
+  # world-readable so the unprivileged extension can poll status without
+  # needing another pkexec round-trip.
+  local active=$1 ifname=$2 ap_iface=$3 ssid=$4 internet=$5 pid=$6
+  cat >"$STATUS_FILE.tmp" <<EOF
+{
+  "active": $active,
+  "ifname": "$ifname",
+  "ap_iface": "$ap_iface",
+  "ssid": "$ssid",
+  "internet": "$internet",
+  "pid": $pid,
+  "updated": "$(date -Is)"
+}
+EOF
+  mv "$STATUS_FILE.tmp" "$STATUS_FILE"
+  chmod 644 "$STATUS_FILE"
+}
+
+cmd_start() {
+  local ifname="" internet="" ssid="" password="" channel="1" wpa="2"
+  local band="2.4" hidden="0" psk="0" novirt="0" isolate="0" mac=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    --ifname)
+      ifname=$2
+      shift 2
+      ;;
+    --internet)
+      internet=$2
+      shift 2
+      ;;
+    --ssid)
+      ssid=$2
+      shift 2
+      ;;
+    --password)
+      password=$2
+      shift 2
+      ;;
+    --channel)
+      channel=$2
+      shift 2
+      ;;
+    --wpa)
+      wpa=$2
+      shift 2
+      ;;
+    --band)
+      band=$2
+      shift 2
+      ;;
+    --hidden)
+      hidden=$2
+      shift 2
+      ;;
+    --psk)
+      psk=$2
+      shift 2
+      ;;
+    --no-virt)
+      novirt=$2
+      shift 2
+      ;;
+    --isolate)
+      isolate=$2
+      shift 2
+      ;;
+    --mac)
+      mac=$2
+      shift 2
+      ;;
+    *) die "unknown option $1" ;;
+    esac
+  done
+
+  is_iface "$ifname" || die "invalid or missing WiFi interface: $ifname"
+
+  if [[ -n "$internet" && "$internet" != "none" ]]; then
+    is_iface "$internet" || die "invalid internet interface: $internet"
+  fi
+
+  [[ -n "$ssid" && ${#ssid} -le 32 ]] || die "SSID must be 1-32 chars"
+  require_not_flag "$ssid"
+
+  if [[ "$psk" == "1" ]]; then
+    [[ "$password" =~ ^[0-9a-fA-F]{64}$ ]] || die "raw PSK must be exactly 64 hex digits"
+  elif [[ -n "$password" ]]; then
+    [[ ${#password} -ge 8 && ${#password} -le 63 ]] || die "password must be 8-63 chars"
+    require_not_flag "$password"
+  fi
+
+  [[ "$channel" =~ ^[0-9]{1,3}$ && "$channel" -ge 1 && "$channel" -le 196 ]] || die "bad channel"
+  [[ "$wpa" =~ ^(1|2|1\+2)$ ]] || die "bad wpa version"
+  [[ "$band" =~ ^(2\.4|5)$ ]] || die "bad band"
+  [[ "$hidden" =~ ^(0|1)$ ]] || die "bad hidden flag"
+  [[ "$psk" =~ ^(0|1)$ ]] || die "bad psk flag"
+  [[ "$novirt" =~ ^(0|1)$ ]] || die "bad no-virt flag"
+  [[ "$isolate" =~ ^(0|1)$ ]] || die "bad isolate flag"
+  if [[ -n "$mac" ]]; then
+    [[ "$mac" =~ ^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$ ]] || die "bad MAC address"
+  fi
+
+  command -v create_ap >/dev/null 2>&1 || die "create_ap is not installed (see README)"
+
+  # Stop any instance already running on this interface first.
+  create_ap --stop "$ifname" >/dev/null 2>&1 || true
+  sleep 1
+
+  local args=(-c "$channel" -w "$wpa" --freq-band "$band")
+  [[ "$hidden" == "1" ]] && args+=(--hidden)
+  [[ "$psk" == "1" ]] && args+=(--psk)
+  [[ "$novirt" == "1" ]] && args+=(--no-virt)
+  [[ "$isolate" == "1" ]] && args+=(--isolate-clients)
+  [[ -n "$mac" ]] && args+=(--mac "$mac")
+
+  args+=(--daemon --pidfile "$STATE_DIR/$ifname.pid" --logfile "$LOG_FILE")
+
+  if [[ -z "$internet" || "$internet" == "none" ]]; then
+    args+=(-n "$ifname" "$ssid")
+  else
+    # Same interface for both = classic "AP + client at once on one
+    # card" mode: create_ap spins up a virtual AP interface (unless
+    # --no-virt is set) and shares whatever connection $ifname already
+    # has as a client onto it.
+    args+=("$ifname" "$internet" "$ssid")
+  fi
+  [[ -n "$password" ]] && args+=("$password")
+
+  log "starting: create_ap ${args[*]/$password/******}"
+  create_ap "${args[@]}" >>"$LOG_FILE" 2>&1
+
+  sleep 1
+  local pid=0
+  [[ -f "$STATE_DIR/$ifname.pid" ]] && pid=$(cat "$STATE_DIR/$ifname.pid")
+
+  # create_ap reports the AP-mode interface name (ap0 etc.) in its log;
+  # best-effort scrape, fall back to $ifname (used directly in --no-virt).
+  local ap_iface
+  ap_iface=$(grep -oE "AP-Enabling '[^']+'" "$LOG_FILE" | tail -n1 | sed -E "s/AP-Enabling '([^']+)'/\1/") || true
+  [[ -z "$ap_iface" ]] && ap_iface="$ifname"
+
+  write_status true "$ifname" "$ap_iface" "$ssid" "${internet:-none}" "$pid"
+  echo "started"
+}
+
+cmd_stop() {
+  local ifname=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    --ifname)
+      ifname=$2
+      shift 2
+      ;;
+    *) die "unknown option $1" ;;
+    esac
+  done
+  is_iface "$ifname" || die "invalid interface: $ifname"
+
+  log "stopping: create_ap --stop $ifname"
+  create_ap --stop "$ifname" >>"$LOG_FILE" 2>&1 || true
+  rm -f "$STATE_DIR/$ifname.pid"
+  write_status false "$ifname" "" "" "" 0
+  echo "stopped"
+}
+
+case "${1:-}" in
+start)
+  shift
+  cmd_start "$@"
+  ;;
+stop)
+  shift
+  cmd_stop "$@"
+  ;;
+*) die "usage: $0 {start|stop} [options]" ;;
+esac

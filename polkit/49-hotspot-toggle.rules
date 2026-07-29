@@ -1,0 +1,17 @@
+// 49-hotspot-toggle.rules
+// Members of the "hotspot" group get to run the hotspot helper with no
+// password prompt at all. Everyone else falls back to the .policy defaults
+// (auth_admin_keep — their own password, if they're an admin, cached briefly).
+//
+// Set up membership with:
+//   sudo groupadd -f hotspot
+//   sudo usermod -aG hotspot "$USER"
+// then log out and back in (group membership only takes effect on new
+// sessions).
+
+polkit.addRule(function(action, subject) {
+    if (action.id == "local.hotspot-toggle.manage" &&
+        subject.isInGroup("hotspot")) {
+        return polkit.Result.YES;
+    }
+});

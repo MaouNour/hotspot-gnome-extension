@@ -1,0 +1,10 @@
+{
+  "uuid": "hotspot-toggle@maounour",
+  "name": "WiFi Hotspot Toggle",
+  "description": "Toggle your WiFi hotspot on/off from Quick Settings, see the hotspot name and connection state at a glance, and jump straight to hotspot settings (SSID, password, hidden, band, MAC, QR code) via the extension's preferences (the cog icon in the Extensions app).",
+  "shell-version": ["45", "46", "47", "48","49","50"],
+  "url": "",
+  "version": 1,
+  "settings-schema": "org.gnome.shell.extensions.hotspot-toggle",
+  "gettext-domain": "hotspot-toggle"
+}

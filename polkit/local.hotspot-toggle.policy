@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>gnome-hotspot-toggle</vendor>
+
+  <action id="local.hotspot-toggle.manage">
+    <description>Manage the WiFi hotspot (create_ap)</description>
+    <message>Authentication is required to turn the WiFi hotspot on or off</message>
+    <icon_name>network-wireless-hotspot-symbolic</icon_name>
+    <defaults>
+      <!-- auth_admin_keep: needs an administrator password, but caches it
+           for a few minutes so flipping the hotspot on/off repeatedly
+           doesn't re-prompt every time. Members of the "hotspot" group
+           bypass this entirely via the .rules file installed alongside
+           this policy. -->
+      <allow_any>auth_admin_keep</allow_any>
+      <allow_inactive>auth_admin_keep</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <!-- This annotation is what lets `pkexec /usr/local/bin/gnome-hotspot-helper`
+         resolve to this action instead of the generic "run any command"
+         action (which normally requires full admin auth with no group
+         bypass support). -->
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/gnome-hotspot-helper</annotate>
+  </action>
+</policyconfig>
