@@ -103,8 +103,8 @@ class HotspotToggle extends QuickMenuToggle {
                     throw new Error(_('No WiFi interface found'));
 
                 // pkexec pops up the system password dialog here the first
-                // time (or every time, unless the user is in the "hotspot"
-                // polkit-bypass group set up by install-helper.sh).
+                // time (or every time, unless the user is in the sudo/wheel
+                // group, per the polkit rule set up by install-helper.sh).
                 await Hotspot.start({
                     ifname,
                     internet: this._settings.get_string('internet-interface'),
@@ -144,7 +144,10 @@ class HotspotToggle extends QuickMenuToggle {
 
         let status;
         try {
-            status = Hotspot.getStatus();
+            let ifname = this._settings.get_string('wifi-interface');
+            if (!ifname)
+                ifname = Hotspot.defaultWifiInterface();
+            status = await Hotspot.getStatus(ifname);
             const clients = status.active ? await Hotspot.countClients(status.ap_iface) : 0;
             this._applyStatus(status, clients);
         } finally {

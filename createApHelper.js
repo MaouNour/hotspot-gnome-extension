@@ -1,12 +1,17 @@
 // createApHelper.js
 // Talks to /usr/local/bin/gnome-hotspot-helper (installed by install-helper.sh)
-// via `pkexec` for start/stop, since create_ap needs root to drive hostapd/
-// dnsmasq/iptables and to create the virtual AP interface that lets you host
-// a hotspot while staying connected as a WiFi client on the same card.
+// via `pkexec` for start/stop. The helper supervises create_ap as a
+// transient systemd unit (gnome-hotspot-<iface>.service) instead of hand-
+// rolled daemon/pidfile bookkeeping, so start/stop are structurally
+// single-instance: `systemctl stop` blocks until the whole process tree is
+// confirmed dead, and `systemd-run --unit=X --collect` refuses to double-
+// start under the same name.
 //
-// Status is read directly from a world-readable JSON file the helper writes
-// (/run/gnome-hotspot-toggle/status.json) so polling the UI never triggers
-// a pkexec prompt — only actually turning the hotspot on/off does.
+// Status is read two ways, neither requiring another pkexec round-trip:
+//  - the *live* on/off truth comes straight from `systemctl is-active`,
+//    which any local user can query read-only.
+//  - display metadata (SSID, which interface actually ended up hosting the
+//    AP, etc) comes from a world-readable JSON file the helper writes.
 
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
@@ -42,7 +47,33 @@ export function runCommand(argv) {
     });
 }
 
-/** Is the helper + polkit policy installed? */
+/** Like runCommand, but a non-zero exit is a normal outcome (used for
+ * `systemctl is-active`, which exits non-zero for "inactive"/"failed" and
+ * still needs its stdout read). */
+function runCommandTolerant(argv) {
+    return new Promise((resolve) => {
+        let proc;
+        try {
+            proc = new Gio.Subprocess({
+                argv,
+                flags: Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE,
+            });
+            proc.init(null);
+        } catch (e) {
+            resolve('');
+            return;
+        }
+        proc.communicate_utf8_async(null, null, (proc_, res) => {
+            try {
+                const [, stdout] = proc_.communicate_utf8_finish(res);
+                resolve((stdout || '').trim());
+            } catch (e) {
+                resolve('');
+            }
+        });
+    });
+}
+
 export function isHelperInstalled() {
     return GLib.file_test(HELPER, GLib.FileTest.IS_EXECUTABLE);
 }
@@ -51,7 +82,14 @@ export function isCreateApInstalled() {
     return GLib.find_program_in_path('create_ap') !== null;
 }
 
-/** List WiFi device interface names using unprivileged `iw`/sysfs, no nmcli/root needed. */
+export function isSystemdAvailable() {
+    return GLib.find_program_in_path('systemd-run') !== null;
+}
+
+export function unitNameFor(ifname) {
+    return `gnome-hotspot-${ifname}.service`;
+}
+
 export function listWifiInterfaces() {
     const ifaces = [];
     try {
@@ -65,7 +103,7 @@ export function listWifiInterfaces() {
                 ifaces.push(name);
         }
     } catch (e) {
-        // ignore, return whatever we found (possibly empty)
+        // ignore
     }
     return ifaces;
 }
@@ -92,19 +130,39 @@ export function defaultWifiInterface() {
     return ifaces.length ? ifaces[0] : null;
 }
 
-/** Read the world-readable status file the root helper maintains. No pkexec needed. */
-export function getStatus() {
+function readMetadata() {
     try {
         const [ok, contents] = GLib.file_get_contents(STATUS_FILE);
-        if (!ok) return {active: false};
-        const text = new TextDecoder().decode(contents);
-        return JSON.parse(text);
+        if (!ok) return {};
+        return JSON.parse(new TextDecoder().decode(contents));
     } catch (e) {
-        return {active: false};
+        return {};
     }
 }
 
-/** Best-effort connected-client count; works without root on most drivers. */
+/**
+ * Live status for a given interface. `active` comes straight from systemd
+ * (the actual source of truth), never from a file that could go stale if
+ * e.g. hostapd crashed without us being told.
+ */
+export async function getStatus(ifname) {
+    if (!ifname) return {active: false};
+    const unit = unitNameFor(ifname);
+    const state = await runCommandTolerant(['systemctl', 'is-active', unit]);
+    const active = state === 'active' || state === 'activating';
+
+    const meta = readMetadata();
+    const metaMatchesUnit = meta.unit === unit;
+
+    return {
+        active,
+        ifname,
+        ap_iface: metaMatchesUnit ? meta.ap_iface : ifname,
+        ssid: metaMatchesUnit ? meta.ssid : '',
+        internet: metaMatchesUnit ? meta.internet : '',
+    };
+}
+
 export async function countClients(apIface) {
     if (!apIface) return 0;
     try {
@@ -118,7 +176,6 @@ export async function countClients(apIface) {
 /**
  * Start the hotspot. opts: { ifname, internet, ssid, password, pskMode,
  * hidden, wpaVersion, band, channel, mac, noVirt, isolateClients }
- * internet: '' (same as ifname, concurrent AP+STA), 'none', or another iface.
  */
 export async function start(opts) {
     const args = [

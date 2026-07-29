@@ -1,10 +1,25 @@
 #!/bin/bash
-# gnome-hotspot-helper — root-side wrapper around create_ap.
+# gnome-hotspot-helper — root-side wrapper around create_ap, supervised by systemd.
 #
 # This script is only ever meant to be invoked via `pkexec` (see the
 # accompanying .policy file, which pins pkexec to this exact path). It is
 # installed root:root mode 0755 so an unprivileged user can't tamper with it
 # and then have pkexec run their version as root.
+#
+# WHY SYSTEMD: earlier versions of this helper tracked create_ap's daemon
+# mode by hand (--daemon + a pidfile, then pkill loops to clean up before a
+# restart). That's inherently racy — a "stop" could return before the old
+# process tree was actually gone, so a fast toggle (or the extension's own
+# polling) could end up stacking a second create_ap on the same interface.
+#
+# Systemd transient units fix this structurally instead of heuristically:
+#   - `systemctl stop <unit>` blocks until the ENTIRE cgroup (create_ap's own
+#     internal re-exec, hostapd, dnsmasq, all of it) is confirmed dead,
+#     escalating to SIGKILL on a timeout if needed.
+#   - `systemd-run --unit=<name> --collect ...` will simply refuse to start
+#     a second instance under the same unit name while one is still active.
+# So two create_ap processes for one hotspot is impossible by construction,
+# not just "prevented if our bash logic happens to run correctly."
 #
 # Because everything here runs as root, every argument is strictly validated
 # before being handed to create_ap. Arguments arrive as a real argv array
@@ -17,22 +32,14 @@ set -euo pipefail
 STATE_DIR=/run/gnome-hotspot-toggle
 STATUS_FILE="$STATE_DIR/status.json"
 LOCK_FILE="$STATE_DIR/lock"
-LOG_FILE=/var/log/gnome-hotspot-helper.log
 mkdir -p "$STATE_DIR"
 chmod 755 "$STATE_DIR"
 
-log() { echo "[$(date -Is)] $*" >> "$LOG_FILE"; }
-
 die() { echo "ERROR: $*" >&2; exit 1; }
 
-# Serialize every start/stop through a single flock. This is the main fix
-# for duplicated create_ap processes: without it, two near-simultaneous
-# invocations (a fast double-toggle, the extension re-enabling while a
-# previous call was still tearing down, etc.) could each try to start their
-# own create_ap instance on the same interface. create_ap has its own
-# internal locking too, but a losing invocation can end up hanging around
-# as a stuck process rather than cleanly exiting, which is exactly the
-# "3 create_ap processes for 1 hostapd/dnsmasq" symptom.
+# Still worth serializing our own start/stop calls even with systemd doing
+# the heavy lifting underneath — avoids two pkexec invocations racing on
+# the reset-failed/systemd-run sequence itself.
 exec 9>"$LOCK_FILE"
 flock -w 20 9 || die "another hotspot start/stop is already in progress, try again in a moment"
 
@@ -47,18 +54,23 @@ require_not_flag() {
     [[ "$v" != -* ]] || die "value '$v' must not start with '-'"
 }
 
+unit_name() {
+    echo "gnome-hotspot-$1.service"
+}
+
 write_status() {
     # world-readable so the unprivileged extension can poll status without
-    # needing another pkexec round-trip.
-    local active=$1 ifname=$2 ap_iface=$3 ssid=$4 internet=$5 pid=$6
+    # needing another pkexec round-trip. The *live* on/off truth comes from
+    # `systemctl is-active` (queried directly by the extension, no root
+    # needed); this file just carries display metadata (SSID etc).
+    local ifname=$1 ap_iface=$2 ssid=$3 internet=$4
     cat > "$STATUS_FILE.tmp" <<EOF
 {
-  "active": $active,
   "ifname": "$ifname",
   "ap_iface": "$ap_iface",
   "ssid": "$ssid",
   "internet": "$internet",
-  "pid": $pid,
+  "unit": "$(unit_name "$ifname")",
   "updated": "$(date -Is)"
 }
 EOF
@@ -66,43 +78,14 @@ EOF
     chmod 644 "$STATUS_FILE"
 }
 
-# Stop every create_ap instance associated with $ifname and *verify* they're
-# actually gone before returning, instead of firing --stop once and hoping.
-stop_all_instances() {
+# Fully and synchronously tear down any existing unit for this interface.
+stop_unit() {
     local ifname=$1
-    local tries=0
-
-    # Ask create_ap nicely first — this is the normal, clean shutdown path
-    # (stops hostapd/dnsmasq, tears down the virtual interface, etc.).
-    while create_ap --list-running 2>/dev/null | grep -qw "$ifname"; do
-        create_ap --stop "$ifname" >/dev/null 2>&1 || true
-        sleep 1
-        tries=$((tries + 1))
-        [[ $tries -ge 5 ]] && break
-    done
-
-    # Belt-and-braces: if create_ap's own bookkeeping got confused (e.g. a
-    # prior instance that didn't shut down cleanly), reap any leftover
-    # create_ap/hostapd/dnsmasq processes tied to this interface directly.
-    pkill -f "create_ap[[:space:]].*[[:space:]]${ifname}([[:space:]]|$)" 2>/dev/null || true
-    pkill -f "hostapd .*/tmp/create_ap\.${ifname}\." 2>/dev/null || true
-    pkill -f "dnsmasq .*/tmp/create_ap\.${ifname}\." 2>/dev/null || true
-
-    # Now actually wait for them to be gone before we proceed to start a
-    # new instance — this is the part the old version skipped (it just
-    # slept 1s and hoped).
-    local waited=0
-    while pgrep -f "create_ap[[:space:]].*[[:space:]]${ifname}([[:space:]]|$)" >/dev/null 2>&1; do
-        [[ $waited -ge 8 ]] && break
-        sleep 1
-        waited=$((waited + 1))
-    done
-
-    if pgrep -f "create_ap[[:space:]].*[[:space:]]${ifname}([[:space:]]|$)" >/dev/null 2>&1; then
-        log "WARNING: a create_ap process for $ifname is still alive after cleanup, forcing SIGKILL"
-        pkill -9 -f "create_ap[[:space:]].*[[:space:]]${ifname}([[:space:]]|$)" 2>/dev/null || true
-        sleep 1
-    fi
+    local unit; unit=$(unit_name "$ifname")
+    systemctl stop "$unit" >/dev/null 2>&1 || true
+    # Clear "failed" state (e.g. from a previous crash) so systemd-run is
+    # willing to reuse the unit name immediately.
+    systemctl reset-failed "$unit" >/dev/null 2>&1 || true
 }
 
 cmd_start() {
@@ -155,8 +138,13 @@ cmd_start() {
     fi
 
     command -v create_ap >/dev/null 2>&1 || die "create_ap is not installed (see README)"
+    command -v systemd-run >/dev/null 2>&1 || die "systemd-run not found; this helper requires systemd"
 
-    stop_all_instances "$ifname"
+    local unit; unit=$(unit_name "$ifname")
+
+    # Synchronous, verified teardown of any previous instance on this
+    # interface before we even think about starting a new one.
+    stop_unit "$ifname"
 
     local args=(-c "$channel" -w "$wpa" --freq-band "$band")
     [[ "$hidden" == "1" ]] && args+=(--hidden)
@@ -164,8 +152,9 @@ cmd_start() {
     [[ "$novirt" == "1" ]] && args+=(--no-virt)
     [[ "$isolate" == "1" ]] && args+=(--isolate-clients)
     [[ -n "$mac" ]] && args+=(--mac "$mac")
-
-    args+=(--daemon --pidfile "$STATE_DIR/$ifname.pid" --logfile "$LOG_FILE")
+    # No --daemon/--pidfile/--logfile here: systemd itself supervises the
+    # foreground process and captures its output in the journal
+    # (`journalctl -u gnome-hotspot-<iface>.service`).
 
     if [[ -z "$internet" || "$internet" == "none" ]]; then
         args+=(-n "$ifname" "$ssid")
@@ -178,20 +167,23 @@ cmd_start() {
     fi
     [[ -n "$password" ]] && args+=("$password")
 
-    log "starting: create_ap ${args[*]/$password/******}"
-    create_ap "${args[@]}" >>"$LOG_FILE" 2>&1
+    systemd-run \
+        --unit="$unit" \
+        --description="GNOME Hotspot ($ifname)" \
+        --collect \
+        --property=Restart=no \
+        /usr/bin/env create_ap "${args[@]}"
 
+    # Give hostapd/dnsmasq a moment to come up so status right after
+    # toggling reflects reality instead of a still-starting unit.
     sleep 1
-    local pid=0
-    [[ -f "$STATE_DIR/$ifname.pid" ]] && pid=$(cat "$STATE_DIR/$ifname.pid")
 
-    # create_ap reports the AP-mode interface name (ap0 etc.) in its log;
-    # best-effort scrape, fall back to $ifname (used directly in --no-virt).
     local ap_iface
-    ap_iface=$(grep -oE "AP-Enabling '[^']+'" "$LOG_FILE" | tail -n1 | sed -E "s/AP-Enabling '([^']+)'/\1/") || true
+    ap_iface=$(journalctl -u "$unit" --no-pager -o cat 2>/dev/null \
+        | grep -oE "AP-Enabling '[^']+'" | tail -n1 | sed -E "s/AP-Enabling '([^']+)'/\1/") || true
     [[ -z "$ap_iface" ]] && ap_iface="$ifname"
 
-    write_status true "$ifname" "$ap_iface" "$ssid" "${internet:-none}" "$pid"
+    write_status "$ifname" "$ap_iface" "$ssid" "${internet:-none}"
     echo "started"
 }
 
@@ -205,10 +197,8 @@ cmd_stop() {
     done
     is_iface "$ifname" || die "invalid interface: $ifname"
 
-    log "stopping: $ifname"
-    stop_all_instances "$ifname"
-    rm -f "$STATE_DIR/$ifname.pid"
-    write_status false "$ifname" "" "" "" 0
+    stop_unit "$ifname"
+    write_status "$ifname" "" "" ""
     echo "stopped"
 }
 
