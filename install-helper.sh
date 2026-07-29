@@ -8,19 +8,19 @@
 set -euo pipefail
 
 if [[ $EUID -ne 0 ]]; then
-  echo "Run this with sudo: sudo ./install-helper.sh"
-  exit 1
+    echo "Run this with sudo: sudo ./install-helper.sh"
+    exit 1
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "==> Checking create_ap is installed..."
 if ! command -v create_ap >/dev/null 2>&1; then
-  cat <<'EOF'
+    cat <<'EOF'
 create_ap was not found on PATH.
 Install it first, e.g.:
 
-    git clone https://github.com/MaouNour/Hotspot-Access-point-On-Linux.git ./create_ap
+    git clone https://github.com/oblique/create_ap
     cd create_ap
     sudo make install
 
@@ -29,7 +29,7 @@ Dependencies (Debian/Ubuntu): util-linux procps hostapd iproute2 iw \
 
 Re-run this script after installing create_ap.
 EOF
-  exit 1
+    exit 1
 fi
 echo "    found: $(command -v create_ap)"
 
@@ -47,17 +47,17 @@ groupadd -f hotspot
 
 TARGET_USER="${SUDO_USER:-}"
 if [[ -n "$TARGET_USER" ]]; then
-  read -r -p "Add user '$TARGET_USER' to the 'hotspot' group so toggling never asks for a password? [Y/n] " reply
-  reply=${reply:-Y}
-  if [[ "$reply" =~ ^[Yy] ]]; then
-    usermod -aG hotspot "$TARGET_USER"
-    echo "    Added. Log out and back in for it to take effect."
-  else
-    echo "    Skipped — you'll get a password prompt (cached briefly) each time you toggle the hotspot."
-  fi
+    read -r -p "Add user '$TARGET_USER' to the 'hotspot' group so toggling never asks for a password? [Y/n] " reply
+    reply=${reply:-Y}
+    if [[ "$reply" =~ ^[Yy] ]]; then
+        usermod -aG hotspot "$TARGET_USER"
+        echo "    Added. Log out and back in for it to take effect."
+    else
+        echo "    Skipped — you'll get a password prompt (cached briefly) each time you toggle the hotspot."
+    fi
 else
-  echo "    Could not detect the invoking user (SUDO_USER unset)."
-  echo "    Add yourself manually: sudo usermod -aG hotspot \$USER, then log out/in."
+    echo "    Could not detect the invoking user (SUDO_USER unset)."
+    echo "    Add yourself manually: sudo usermod -aG hotspot \$USER, then log out/in."
 fi
 
 systemctl restart polkit 2>/dev/null || service polkit restart 2>/dev/null || true

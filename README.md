@@ -125,6 +125,43 @@ string to copy instead.
   SSID/password length and charset checks, channel/band/MAC format checks)
   before it's ever handed to `create_ap`.
 
+## Troubleshooting: duplicate create_ap processes
+
+If you see more than one `create_ap` process for the same interface in
+`htop`/`btop`, it's from an older copy of the helper — the current
+`gnome-hotspot-helper` serializes every start/stop through a single lock
+(`/run/gnome-hotspot-toggle/lock`) and, before starting a new instance,
+actively verifies the old one is fully dead (retrying `create_ap --stop`,
+then `pkill` as a fallback) rather than just sleeping a second and hoping.
+Re-run `sudo ./install-helper.sh` to pick up the fix, and if you already
+have stragglers, clear them once with:
+
+```sh
+sudo pkill -f 'create_ap.*<your-wifi-iface>'
+```
+
+## Troubleshooting: hotspot process appears/disappears every few seconds (only via the UI)
+
+If toggling from the terminal (`sudo create_ap ...`) was rock solid but the
+same settings via the extension caused a `create_ap` process to balloon in
+memory and restart every ~5 seconds, with no repeated password prompt — that
+was the extension's own status-polling loop (every 3s) accidentally
+re-triggering a restart, silently, because polkit's `auth_admin_keep` caches
+the authorization for a few minutes so you wouldn't see it asking again.
+
+`extension.js` now has three independent guards against this:
+1. `refresh()` marks its own programmatic `checked` assignment with a
+   `_syncingFromStatus` flag, and the click handler ignores clicks while
+   that flag is set.
+2. The click handler no-ops if the requested state already matches the last
+   known real status (nothing to restart).
+3. A hard 4-second cooldown between actual start/stop actions makes a tight
+   restart loop impossible even if something upstream still manages to
+   re-fire the click handler.
+
+Update to the latest `extension.js` and reload the shell (`Alt+F2` `r` on
+X11, or log out/in on Wayland) to pick this up.
+
 ## Known limitations
 
 - MAC filtering (accept/deny ACLs) isn't implemented.

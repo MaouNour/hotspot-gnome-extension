@@ -24,6 +24,10 @@ class HotspotToggle extends QuickMenuToggle {
         this._extensionObject = extensionObject;
         this._settings = settings;
         this._busy = false;
+        this._refreshing = false;
+        this._syncingFromStatus = false;
+        this._lastKnownActive = false;
+        this._lastActionTime = 0;
 
         this.menu.setHeader(ICON_ON, _('WiFi Hotspot'), _('Loading…'));
 
@@ -45,8 +49,32 @@ class HotspotToggle extends QuickMenuToggle {
     }
 
     _onClicked() {
+        // Defensive guard #1: refresh() sets `this.checked` from the real
+        // status every poll. If that property assignment ever causes this
+        // 'clicked' handler to fire too (some St.Button-based toggles do
+        // this), we must not treat it as a real user click, or we'd end up
+        // restarting the hotspot every poll cycle forever — which is
+        // exactly the "appears/disappears every ~5s, no password prompt
+        // because auth is cached" symptom.
+        if (this._syncingFromStatus) return;
         if (this._busy) return;
+
         const wantOn = this.checked;
+
+        // Defensive guard #2: if the requested state already matches what
+        // we last observed as the real, live status, there's nothing to
+        // do — don't restart an already-running (or already-stopped)
+        // hotspot just because something re-emitted 'clicked'.
+        if (wantOn === this._lastKnownActive) return;
+
+        // Defensive guard #3: hard cooldown between actual start/stop
+        // actions. Even if guards #1/#2 somehow don't catch a spurious
+        // re-trigger, this makes a tight restart loop physically
+        // impossible.
+        const now = GLib.get_monotonic_time() / 1000;
+        if (now - this._lastActionTime < 4000) return;
+        this._lastActionTime = now;
+
         this._busy = true;
         this._runToggle(wantOn).finally(() => {
             this._busy = false;
@@ -107,10 +135,34 @@ class HotspotToggle extends QuickMenuToggle {
     }
 
     async refresh() {
-        const status = Hotspot.getStatus();
-        const clients = status.active ? await Hotspot.countClients(status.ap_iface) : 0;
+        // Never let two refreshes overlap (e.g. a slow `iw` call from one
+        // poll tick still running when the next tick fires) — that's
+        // another way stale/duplicate state could end up driving spurious
+        // actions.
+        if (this._refreshing) return;
+        this._refreshing = true;
 
+        let status;
+        try {
+            status = Hotspot.getStatus();
+            const clients = status.active ? await Hotspot.countClients(status.ap_iface) : 0;
+            this._applyStatus(status, clients);
+        } finally {
+            this._refreshing = false;
+        }
+    }
+
+    _applyStatus(status, clients) {
+        this._lastKnownActive = !!status.active;
+
+        // Setting `checked` here is programmatic, not a user click. Guard
+        // #1 in _onClicked() checks this flag so that even if the toggle
+        // widget internally treats a `checked` assignment like a click,
+        // it can never cascade into a restart loop.
+        this._syncingFromStatus = true;
         this.checked = !!status.active;
+        this._syncingFromStatus = false;
+
         this.iconName = status.active ? ICON_ON : ICON_OFF;
 
         const displaySsid = status.ssid || this._settings.get_string('ssid') || _('Hotspot');
