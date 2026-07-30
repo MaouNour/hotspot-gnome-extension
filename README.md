@@ -78,7 +78,7 @@ So two create_ap processes for one hotspot isn't just "prevented if the
  happen given how systemd unit names work.  
 **Install**  
 **1. Install create_ap (if you haven't already)**  
-git clone [https://github.com/MaouNour/hotspot-gnome-extension](https://github.com/MaouNour/hotspot-gnome-extension "https://github.com/MaouNour/hotspot-gnome-extension") ./create_ap  
+git clone https://github.com/MaouNour/Hotspot-Access-point-On-Linux.git ./create_ap  
  cd create_ap  
  sudo make install  
    
