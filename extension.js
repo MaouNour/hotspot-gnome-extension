@@ -1,5 +1,6 @@
 import GObject from 'gi://GObject';
 import GLib from 'gi://GLib';
+import Gio from 'gi://Gio';
 
 import {QuickMenuToggle, SystemIndicator} from 'resource:///org/gnome/shell/ui/quickSettings.js';
 import {Extension, gettext as _} from 'resource:///org/gnome/shell/extensions/extension.js';
@@ -11,6 +12,23 @@ import * as Hotspot from './createApHelper.js';
 const POLL_SECONDS = 3;
 const ICON_ON = 'network-wireless-hotspot-symbolic';
 const ICON_OFF = 'network-wireless-disabled-symbolic';
+
+// Session-bus control interface, exported on the shell's own connection:
+//   gdbus call --session --dest org.gnome.Shell \
+//     --object-path /org/gnome/Shell/Extensions/HotspotToggle \
+//     --method org.gnome.Shell.Extensions.HotspotToggle.Toggle
+// Methods return immediately (they only request the change). State is pushed
+// out via the standard PropertiesChanged signal, so listeners never poll.
+const DBUS_PATH = '/org/gnome/Shell/Extensions/HotspotToggle';
+const DBUS_IFACE = `
+<node>
+  <interface name="org.gnome.Shell.Extensions.HotspotToggle">
+    <method name="Toggle"/>
+    <method name="Start"/>
+    <method name="Stop"/>
+    <property name="Active" type="b" access="read"/>
+  </interface>
+</node>`;
 
 const HotspotToggle = GObject.registerClass(
 class HotspotToggle extends QuickMenuToggle {
@@ -28,6 +46,7 @@ class HotspotToggle extends QuickMenuToggle {
         this._syncingFromStatus = false;
         this._lastKnownActive = false;
         this._lastActionTime = 0;
+        this._onActiveChanged = null;
 
         this.menu.setHeader(ICON_ON, _('WiFi Hotspot'), _('Loading…'));
 
@@ -79,6 +98,20 @@ class HotspotToggle extends QuickMenuToggle {
         this._runToggle(wantOn).finally(() => {
             this._busy = false;
         });
+    }
+
+    /** Programmatic request (D-Bus). Same effect as clicking the tile. */
+    requestState(wantOn) {
+        if (this._busy) return;
+        if (wantOn === this._lastKnownActive) return;
+        this._busy = true;
+        this._runToggle(wantOn).finally(() => {
+            this._busy = false;
+        });
+    }
+
+    setActiveChangedCallback(cb) {
+        this._onActiveChanged = cb;
     }
 
     async _runToggle(wantOn) {
@@ -165,6 +198,7 @@ class HotspotToggle extends QuickMenuToggle {
     }
 
     _applyStatus(status, clients) {
+        const wasActive = this._lastKnownActive;
         this._lastKnownActive = !!status.active;
 
         // Setting `checked` here is programmatic, not a user click. Guard
@@ -188,6 +222,9 @@ class HotspotToggle extends QuickMenuToggle {
         this._clientsItem.label.text = status.active
             ? _('Connected devices: %d').format(clients)
             : _('Connected devices: —');
+
+        if (wasActive !== this._lastKnownActive && this._onActiveChanged)
+            this._onActiveChanged(this._lastKnownActive);
     }
 });
 
@@ -217,6 +254,25 @@ export default class HotspotToggleExtension extends Extension {
         this._indicator = new HotspotIndicator(this, this._settings);
         Main.panel.statusArea.quickSettings.addExternalIndicator(this._indicator);
 
+        const toggle = this._indicator._toggle;
+        try {
+            this._dbus = Gio.DBusExportedObject.wrapJSObject(DBUS_IFACE, {
+                Toggle: () => toggle.requestState(!toggle._lastKnownActive),
+                Start: () => toggle.requestState(true),
+                Stop: () => toggle.requestState(false),
+                get Active() {
+                    return toggle._lastKnownActive;
+                },
+            });
+            this._dbus.export(Gio.DBus.session, DBUS_PATH);
+            toggle.setActiveChangedCallback(active => {
+                this._dbus?.emit_property_changed('Active', GLib.Variant.new_boolean(active));
+            });
+        } catch (e) {
+            logError(e, 'hotspot-toggle: D-Bus export failed');
+            this._dbus = null;
+        }
+
         this._pollId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, POLL_SECONDS, () => {
             this._indicator._toggle.refresh();
             return GLib.SOURCE_CONTINUE;
@@ -227,6 +283,11 @@ export default class HotspotToggleExtension extends Extension {
     }
 
     disable() {
+        if (this._dbus) {
+            this._indicator?._toggle?.setActiveChangedCallback(null);
+            this._dbus.unexport();
+            this._dbus = null;
+        }
         if (this._pollId) {
             GLib.source_remove(this._pollId);
             this._pollId = null;
