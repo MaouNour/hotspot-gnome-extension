@@ -151,6 +151,12 @@ export async function getStatus(ifname) {
     const state = await runCommandTolerant(['systemctl', 'is-active', unit]);
     const active = state === 'active' || state === 'activating';
 
+    if (!active && await nmIsActive(ifname)) {
+        const ssid = await runCommandTolerant(
+            ['nmcli', '-g', '802-11-wireless.ssid', 'connection', 'show', nmConnectionName(ifname)]);
+        return {active: true, ifname, ap_iface: ifname, ssid, internet: '', backend: BACKEND_NM};
+    }
+
     const meta = readMetadata();
     const metaMatchesUnit = meta.unit === unit;
 
@@ -200,6 +206,130 @@ export async function start(opts) {
 
 export async function stop(ifname) {
     return runCommand(['pkexec', HELPER, 'stop', '--ifname', ifname]);
+}
+
+// ---------------------------------------------------------------------------
+// NetworkManager backend (optional alternative to create_ap).
+//
+// Uses `nmcli` to create a temporary (memory-only) AP-mode connection with
+// ipv4.method=shared, which is the same mechanism GNOME Settings' own
+// "Turn On Wi-Fi Hotspot" uses. No root helper / pkexec is involved; whether
+// polkit prompts is up to NetworkManager's own policy.
+// ---------------------------------------------------------------------------
+
+export const BACKEND_CREATE_AP = 'create_ap';
+export const BACKEND_NM = 'networkmanager';
+
+export function isNmcliInstalled() {
+    return GLib.find_program_in_path('nmcli') !== null;
+}
+
+export function nmConnectionName(ifname) {
+    return `hotspot-toggle-${ifname}`;
+}
+
+export async function nmIsActive(ifname) {
+    if (!ifname) return false;
+    const out = await runCommandTolerant(
+        ['nmcli', '-t', '-f', 'NAME', 'connection', 'show', '--active']);
+    const name = nmConnectionName(ifname);
+    return out.split('\n').some(line => line.trim() === name);
+}
+
+async function isCreateApUnitActive(ifname) {
+    if (!ifname) return false;
+    const state = await runCommandTolerant(['systemctl', 'is-active', unitNameFor(ifname)]);
+    return state === 'active' || state === 'activating';
+}
+
+export async function nmStart(opts) {
+    const ifname = opts.ifname;
+    const ssid = opts.ssid;
+    const password = opts.password || '';
+    const wpa = opts.wpaVersion || '2';
+    const band = opts.band || '2.4';
+    const channel = opts.channel || 1;
+    const name = nmConnectionName(ifname);
+
+    // Same sanity checks the root helper does for create_ap.
+    if (!ssid || ssid.length > 32)
+        throw new Error('SSID must be 1-32 chars');
+    if (opts.pskMode) {
+        if (!/^[0-9a-fA-F]{64}$/.test(password))
+            throw new Error('raw PSK must be exactly 64 hex digits');
+    } else if (password && (password.length < 8 || password.length > 63)) {
+        throw new Error('password must be 8-63 chars');
+    }
+
+    // Remove any previous instance so new settings always apply.
+    await runCommandTolerant(['nmcli', 'connection', 'delete', 'id', name]);
+
+    const args = [
+        'nmcli', 'connection', 'add', 'save', 'no',
+        'type', 'wifi',
+        'ifname', ifname,
+        'con-name', name,
+        'autoconnect', 'no',
+        'ssid', ssid,
+        '802-11-wireless.mode', 'ap',
+        '802-11-wireless.band', band === '5' ? 'a' : 'bg',
+        '802-11-wireless.channel', String(channel),
+        '802-11-wireless.hidden', opts.hidden ? 'yes' : 'no',
+        'ipv4.method', 'shared',
+        'ipv6.method', 'ignore',
+    ];
+    if (opts.mac)
+        args.push('802-11-wireless.cloned-mac-address', opts.mac);
+    if (password) {
+        const proto = wpa === '1' ? 'wpa' : wpa === '1+2' ? 'wpa,rsn' : 'rsn';
+        args.push('wifi-sec.key-mgmt', 'wpa-psk',
+            'wifi-sec.psk', password,
+            'wifi-sec.proto', proto);
+        if (proto === 'rsn')
+            args.push('wifi-sec.pairwise', 'ccmp', 'wifi-sec.group', 'ccmp');
+    }
+
+    await runCommand(args);
+
+    if (opts.isolateClients) {
+        // Only newer NetworkManager versions know this property; ignore failure.
+        await runCommandTolerant(
+            ['nmcli', 'connection', 'modify', name, '802-11-wireless.ap-isolation', 'yes']);
+    }
+
+    try {
+        await runCommand(['nmcli', 'connection', 'up', 'id', name, 'ifname', ifname]);
+    } catch (e) {
+        await runCommandTolerant(['nmcli', 'connection', 'delete', 'id', name]);
+        throw e;
+    }
+    return 'started';
+}
+
+export async function nmStop(ifname) {
+    await runCommandTolerant(['nmcli', 'connection', 'down', 'id', nmConnectionName(ifname)]);
+    await runCommandTolerant(['nmcli', 'connection', 'delete', 'id', nmConnectionName(ifname)]);
+    return 'stopped';
+}
+
+/** Start with the chosen backend, first making sure the other backend isn't
+ * already running on the same interface. */
+export async function startHotspot(backend, opts) {
+    if (backend === BACKEND_NM) {
+        if (await isCreateApUnitActive(opts.ifname))
+            await stop(opts.ifname);
+        return nmStart(opts);
+    }
+    if (await nmIsActive(opts.ifname))
+        await nmStop(opts.ifname);
+    return start(opts);
+}
+
+/** Stop whichever backend is currently running on this interface. */
+export async function stopHotspot(ifname) {
+    if (await nmIsActive(ifname))
+        return nmStop(ifname);
+    return stop(ifname);
 }
 
 export function wifiQrString({ssid, password, hidden}) {

@@ -20,7 +20,15 @@ export default class HotspotToggleprefs extends ExtensionPreferences {
     });
     window.add(page);
 
-    if (!Hotspot.isCreateApInstalled() || !Hotspot.isHelperInstalled()) {
+    const usingNm = settings.get_string("backend") === Hotspot.BACKEND_NM;
+    if (usingNm && !Hotspot.isNmcliInstalled()) {
+      const warnGroup = new Adw.PreferencesGroup();
+      page.add(warnGroup);
+      warnGroup.add(new Adw.ActionRow({
+        title: _("Setup needed"),
+        subtitle: _("nmcli (NetworkManager) was not found."),
+      }));
+    } else if (!usingNm && (!Hotspot.isCreateApInstalled() || !Hotspot.isHelperInstalled())) {
       const warnGroup = new Adw.PreferencesGroup();
       page.add(warnGroup);
       const warnRow = new Adw.ActionRow({
@@ -140,6 +148,20 @@ export default class HotspotToggleprefs extends ExtensionPreferences {
     });
     page.add(deviceGroup);
 
+    const backendRow = new Adw.ComboRow({
+      title: _("Hotspot backend"),
+      subtitle: _(
+        "create_ap (default) supports concurrent AP + client on one card. NetworkManager uses the built-in GNOME/nmcli hotspot and needs no root helper.",
+      ),
+      model: Gtk.StringList.new(["create_ap", "NetworkManager"]),
+    });
+    const backendMap = [Hotspot.BACKEND_CREATE_AP, Hotspot.BACKEND_NM];
+    backendRow.selected = Math.max(0, backendMap.indexOf(settings.get_string("backend")));
+    backendRow.connect("notify::selected", () => {
+      settings.set_string("backend", backendMap[backendRow.selected]);
+    });
+    deviceGroup.add(backendRow);
+
     const allIfaces = Hotspot.listAllInterfaces();
     const wifiIfaces = Hotspot.listWifiInterfaces();
 
@@ -185,6 +207,16 @@ export default class HotspotToggleprefs extends ExtensionPreferences {
     settings.bind("no-virt", novirtRow, "active", Gio.SettingsBindFlags.DEFAULT);
     deviceGroup.add(novirtRow);
 
+    // These two only apply to create_ap; NetworkManager shares the default
+    // route's connection itself.
+    const syncBackendRows = () => {
+      const isCreateAp = settings.get_string("backend") !== Hotspot.BACKEND_NM;
+      internetRow.sensitive = isCreateAp;
+      novirtRow.sensitive = isCreateAp;
+    };
+    settings.connect("changed::backend", syncBackendRows);
+    syncBackendRows();
+
     const autostartRow = new Adw.SwitchRow({
       title: _("Turn on automatically"),
       subtitle: _("Start the hotspot when the extension loads (e.g. at login)"),
@@ -216,7 +248,7 @@ export default class HotspotToggleprefs extends ExtensionPreferences {
         if (!ifname) throw new Error(_("No WiFi interface found"));
         // pkexec will prompt for a password here (once, or every
         // time, unless the "hotspot" polkit group is set up).
-        await Hotspot.start({
+        await Hotspot.startHotspot(settings.get_string("backend"), {
           ifname,
           internet: settings.get_string("internet-interface"),
           ssid: settings.get_string("ssid") || "hotspot",

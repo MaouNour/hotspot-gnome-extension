@@ -82,15 +82,24 @@ class HotspotToggle extends QuickMenuToggle {
     }
 
     async _runToggle(wantOn) {
-        if (!Hotspot.isCreateApInstalled()) {
-            Main.notifyError(_('Hotspot'), _('create_ap is not installed. See the extension README.'));
-            await this.refresh();
-            return;
-        }
-        if (!Hotspot.isHelperInstalled()) {
-            Main.notifyError(_('Hotspot'), _('Run install-helper.sh once (see README) before using this toggle.'));
-            await this.refresh();
-            return;
+        const backend = this._settings.get_string('backend');
+        if (backend === Hotspot.BACKEND_NM) {
+            if (!Hotspot.isNmcliInstalled()) {
+                Main.notifyError(_('Hotspot'), _('nmcli (NetworkManager) was not found.'));
+                await this.refresh();
+                return;
+            }
+        } else {
+            if (!Hotspot.isCreateApInstalled()) {
+                Main.notifyError(_('Hotspot'), _('create_ap is not installed. See the extension README.'));
+                await this.refresh();
+                return;
+            }
+            if (!Hotspot.isHelperInstalled()) {
+                Main.notifyError(_('Hotspot'), _('Run install-helper.sh once (see README) before using this toggle.'));
+                await this.refresh();
+                return;
+            }
         }
 
         let ifname = this._settings.get_string('wifi-interface');
@@ -105,7 +114,7 @@ class HotspotToggle extends QuickMenuToggle {
                 // pkexec pops up the system password dialog here the first
                 // time (or every time, unless the user is in the sudo/wheel
                 // group, per the polkit rule set up by install-helper.sh).
-                await Hotspot.start({
+                await Hotspot.startHotspot(backend, {
                     ifname,
                     internet: this._settings.get_string('internet-interface'),
                     ssid: this._settings.get_string('ssid') || `${GLib.get_host_name()}-hotspot`,
@@ -120,7 +129,7 @@ class HotspotToggle extends QuickMenuToggle {
                     isolateClients: this._settings.get_boolean('isolate-clients'),
                 });
             } else {
-                await Hotspot.stop(ifname);
+                await Hotspot.stopHotspot(ifname);
             }
         } catch (e) {
             logError(e, 'hotspot-toggle');

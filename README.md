@@ -224,3 +224,6 @@ then re-run sudo ./install-helper.sh to install the new helper + polkit
  Adw.PreferencesWindow). Older GNOME versions use the legacy imports.*  
    
  API and won't load this as-is — say the word if you need a port.  
+
+**Optional: NetworkManager backend**  
+In preferences → Device → **Hotspot backend**, you can switch from create_ap (default) to **NetworkManager**. This uses `nmcli` to bring up a temporary AP-mode connection with shared IPv4 — the same mechanism as GNOME Settings' own hotspot — so it needs no root helper, polkit files or create_ap. SSID, password, hidden, WPA version, band, channel, MAC and (on newer NetworkManager) client isolation are honoured. "Internet from" and "Disable virtual interface" are create_ap-only and are ignored in this mode. Concurrent AP + client on one card depends on your driver/NetworkManager version. Switching backends while a hotspot is running stops the old one before starting the new one.  

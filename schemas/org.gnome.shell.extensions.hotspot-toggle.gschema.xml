@@ -2,6 +2,12 @@
 <schemalist gettext-domain="hotspot-toggle">
   <schema id="org.gnome.shell.extensions.hotspot-toggle" path="/org/gnome/shell/extensions/hotspot-toggle/">
 
+    <key name="backend" type="s">
+      <default>'create_ap'</default>
+      <summary>How the hotspot is created</summary>
+      <description>'create_ap' (default, uses the root helper + create_ap) or 'networkmanager' (uses NetworkManager's built-in hotspot via nmcli; no root helper or create_ap needed).</description>
+    </key>
+
     <key name="wifi-interface" type="s">
       <default>''</default>
       <summary>WiFi interface used to host the hotspot</summary>
