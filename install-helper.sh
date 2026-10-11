@@ -7,19 +7,19 @@
 set -euo pipefail
 
 if [[ $EUID -ne 0 ]]; then
-    echo "Run this with sudo: sudo ./install-helper.sh"
-    exit 1
+  echo "Run this with sudo: sudo ./install-helper.sh"
+  exit 1
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "==> Checking create_ap is installed..."
 if ! command -v create_ap >/dev/null 2>&1; then
-    cat <<'EOF'
+  cat <<'EOF'
 create_ap was not found on PATH.
 Install it first, e.g.:
 
-    git clone https://github.com/oblique/create_ap
+    git clone https://github.com/MaouNour/Hotspot-Access-point-On-Linux create_ap
     cd create_ap
     sudo make install
 
@@ -28,12 +28,15 @@ Dependencies (Debian/Ubuntu): util-linux procps hostapd iproute2 iw \
 
 Re-run this script after installing create_ap.
 EOF
-    exit 1
+  exit 1
 fi
 echo "    found: $(command -v create_ap)"
 
 echo "==> Checking systemd is available..."
-command -v systemd-run >/dev/null 2>&1 || { echo "systemd-run not found; this helper requires systemd."; exit 1; }
+command -v systemd-run >/dev/null 2>&1 || {
+  echo "systemd-run not found; this helper requires systemd."
+  exit 1
+}
 echo "    ok"
 
 echo "==> Installing root helper to /usr/local/bin/gnome-hotspot-helper"
@@ -46,10 +49,10 @@ echo "==> Installing polkit sudo/wheel-group bypass rule"
 install -o root -g root -m 0644 "$SCRIPT_DIR/polkit/49-hotspot-toggle.rules" /etc/polkit-1/rules.d/49-hotspot-toggle.rules
 
 if id -nG "${SUDO_USER:-root}" 2>/dev/null | grep -qwE 'sudo|wheel'; then
-    echo "==> ${SUDO_USER:-root} is already in sudo/wheel — toggling the hotspot won't prompt for a password."
+  echo "==> ${SUDO_USER:-root} is already in sudo/wheel — toggling the hotspot won't prompt for a password."
 else
-    echo "==> Note: ${SUDO_USER:-your user} is not in the sudo/wheel group, so toggling the hotspot"
-    echo "    will ask for an admin password each time (cached briefly by polkit)."
+  echo "==> Note: ${SUDO_USER:-your user} is not in the sudo/wheel group, so toggling the hotspot"
+  echo "    will ask for an admin password each time (cached briefly by polkit)."
 fi
 
 systemctl restart polkit 2>/dev/null || service polkit restart 2>/dev/null || true
